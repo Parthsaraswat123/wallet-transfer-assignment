@@ -23,6 +23,15 @@ public class TransferService {
     private final IdempotencyRecordRepository idempotencyRepository;
     private final ObjectMapper objectMapper;
 
+    /**
+     * Constructs a new TransferService with the required repositories and dependencies.
+     *
+     * @param walletRepository       Repository for wallet balance operations and pessimistic locking.
+     * @param transferRepository     Repository for persisting transfer records.
+     * @param ledgerEntryRepository   Repository for managing double-entry ledger entries.
+     * @param idempotencyRepository   Repository for handling request idempotency caching.
+     * @param objectMapper           Jackson ObjectMapper used for serializing response bodies to JSON.
+     */
     public TransferService(WalletRepository walletRepository,
                            TransferRepository transferRepository,
                            LedgerEntryRepository ledgerEntryRepository,
@@ -36,7 +45,11 @@ public class TransferService {
     }
 
     /**
-     * Checks if a request has already been processed and cached.
+     * Checks if a request has already been processed and cached in the database.
+     * This is used for fast-path idempotency checks outside the main transaction.
+     *
+     * @param idempotencyKey The unique idempotency key for the request.
+     * @return An Optional containing the cached TransferResult, or empty if not found.
      */
     public Optional<TransferResult> getCachedResult(String idempotencyKey) {
         return idempotencyRepository.findById(idempotencyKey)
@@ -44,7 +57,20 @@ public class TransferService {
     }
 
     /**
-     * Executes a transfer under strict concurrency control and idempotency guarantees.
+     * Executes a wallet-to-wallet transfer in a single ACID transaction.
+     * 
+     * Concurrency & Integrity Strategy:
+     * 1. Idempotency Check: Reads the idempotency table inside the transaction boundary
+     *    to guard against concurrent retries.
+     * 2. Deadlock Prevention: Acquires pessimistic write locks on the participating wallets
+     *    in alphabetical/lexicographical order of their IDs. This guarantees a consistent locking order
+     *    across all concurrent threads, eliminating the potential for circular wait conditions (deadlocks).
+     * 3. Balance Check: Ensures the source wallet has sufficient funds.
+     * 4. Double-Entry Ledger: Records both a DEBIT and a CREDIT ledger entry to preserve full transaction trail.
+     * 5. Record/Cache: Saves the outcome in the idempotency table before committing the transaction.
+     *
+     * @param request The transfer request details.
+     * @return The result of the transfer including HTTP status code and response payload.
      */
     @Transactional
     public TransferResult executeTransfer(TransferRequest request) {
@@ -62,13 +88,16 @@ public class TransferService {
         }
 
         // 2. Double-check idempotency table inside the transaction/lock boundary
+        // This handles race conditions where duplicate requests bypass the controller check.
         Optional<IdempotencyRecord> existingRecord = idempotencyRepository.findById(key);
         if (existingRecord.isPresent()) {
             IdempotencyRecord record = existingRecord.get();
             return new TransferResult(record.getResponseStatus(), record.getResponseBody());
         }
 
-        // 3. Acquire pessimistic locks in alphabetical order to prevent deadlocks
+        // 3. Acquire pessimistic locks in alphabetical order to prevent deadlocks.
+        // For example, if thread A transfers from Wallet 1 to Wallet 2, and thread B transfers from
+        // Wallet 2 to Wallet 1, both threads will lock Wallet 1 first, then Wallet 2 sequentially.
         String firstId = fromId.compareTo(toId) < 0 ? fromId : toId;
         String secondId = fromId.compareTo(toId) < 0 ? toId : fromId;
 
@@ -77,6 +106,7 @@ public class TransferService {
         Wallet secondWallet = walletRepository.findByIdForUpdate(secondId)
                 .orElseThrow(() -> new WalletNotFoundException("Wallet not found: " + secondId));
 
+        // Map the ordered locked entities back to the semantic variables
         Wallet fromWallet = firstWallet.getId().equals(fromId) ? firstWallet : secondWallet;
         Wallet toWallet = firstWallet.getId().equals(toId) ? firstWallet : secondWallet;
 
@@ -100,6 +130,7 @@ public class TransferService {
 
             IdempotencyRecord idempotencyRecord = IdempotencyRecord.builder()
                     .key(key)
+                    .transferId(failedTransfer.getId())
                     .responseStatus(422)
                     .responseBody(jsonError)
                     .build();
@@ -108,13 +139,13 @@ public class TransferService {
             return new TransferResult(422, jsonError);
         }
 
-        // 5. Deduct and credit
+        // 5. Deduct from source and credit destination wallet
         fromWallet.setBalance(fromWallet.getBalance().subtract(amount));
         toWallet.setBalance(toWallet.getBalance().add(amount));
         walletRepository.save(fromWallet);
         walletRepository.save(toWallet);
 
-        // 6. Create transfer record
+        // 6. Create successful transfer record
         Transfer processedTransfer = Transfer.builder()
                 .id(UUID.randomUUID().toString())
                 .idempotencyKey(key)
@@ -125,7 +156,8 @@ public class TransferService {
                 .build();
         transferRepository.save(processedTransfer);
 
-        // 7. Double-entry ledger entries
+        // 7. Double-entry ledger consistency
+        // A debit for the sender and a credit for the receiver.
         LedgerEntry debit = LedgerEntry.builder()
                 .id(UUID.randomUUID().toString())
                 .walletId(fromId)
@@ -143,7 +175,7 @@ public class TransferService {
         ledgerEntryRepository.save(debit);
         ledgerEntryRepository.save(credit);
 
-        // 8. Cache response in idempotency records
+        // 8. Cache response in idempotency records table
         TransferResponse responseDto = TransferResponse.builder()
                 .id(processedTransfer.getId())
                 .idempotencyKey(key)
@@ -157,6 +189,7 @@ public class TransferService {
 
         IdempotencyRecord idempotencyRecord = IdempotencyRecord.builder()
                 .key(key)
+                .transferId(processedTransfer.getId())
                 .responseStatus(201)
                 .responseBody(jsonSuccess)
                 .build();
@@ -165,6 +198,9 @@ public class TransferService {
         return new TransferResult(201, jsonSuccess);
     }
 
+    /**
+     * Serializes an object to JSON string.
+     */
     private String toJson(Object obj) {
         try {
             return objectMapper.writeValueAsString(obj);

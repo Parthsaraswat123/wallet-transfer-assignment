@@ -2,15 +2,14 @@ package com.wallet.transfer;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wallet.transfer.model.*;
-import com.wallet.transfer.repository.LedgerEntryRepository;
-import com.wallet.transfer.repository.TransferRepository;
-import com.wallet.transfer.repository.WalletRepository;
+import com.wallet.transfer.repository.*;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
@@ -37,25 +36,35 @@ public class WalletTransferApplicationTests {
     private WalletRepository walletRepository;
 
     @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
     private TransferRepository transferRepository;
 
     @Autowired
     private LedgerEntryRepository ledgerEntryRepository;
 
     @Autowired
+    private IdempotencyRecordRepository idempotencyRecordRepository;
+
+    @Autowired
     private ObjectMapper objectMapper;
+
+    private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
     @BeforeEach
     public void setup() {
-        // Clear all previous test data
+        // Clear all previous test data in correct dependency order
+        userRepository.deleteAll();
+        idempotencyRecordRepository.deleteAll();
         ledgerEntryRepository.deleteAll();
         transferRepository.deleteAll();
         walletRepository.deleteAll();
 
         // Create initial wallets
-        walletRepository.save(new Wallet("wallet_1", new BigDecimal("1000.0000"), null));
-        walletRepository.save(new Wallet("wallet_2", new BigDecimal("500.0000"), null));
-        walletRepository.save(new Wallet("wallet_3", new BigDecimal("0.0000"), null));
+        walletRepository.save(Wallet.builder().id("wallet_1").balance(new BigDecimal("1000.0000")).build());
+        walletRepository.save(Wallet.builder().id("wallet_2").balance(new BigDecimal("500.0000")).build());
+        walletRepository.save(Wallet.builder().id("wallet_3").balance(new BigDecimal("0.0000")).build());
     }
 
     @Test
@@ -211,4 +220,99 @@ public class WalletTransferApplicationTests {
         assertEquals(10, transferRepository.findAll().size());
         assertEquals(20, ledgerEntryRepository.findAll().size());
     }
+
+    @Test
+    public void testUserRegistrationSuccess() throws Exception {
+        UserRegisterRequest request = UserRegisterRequest.builder()
+                .username("john_doe")
+                .email("john@example.com")
+                .phoneno("1234567890")
+                .password("password123")
+                .build();
+
+        mockMvc.perform(post("/user/register")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.username", is("john_doe")))
+                .andExpect(jsonPath("$.email", is("john@example.com")))
+                .andExpect(jsonPath("$.phoneno", is("1234567890")))
+                .andExpect(jsonPath("$.walletId").exists())
+                .andExpect(jsonPath("$.message", is("User registered successfully")));
+
+        // Verify user and wallet created in database
+        UserEntry user = userRepository.findByUsername("john_doe").orElseThrow();
+        assertNotNull(user.getWalletId());
+
+        Wallet wallet = walletRepository.findById(user.getWalletId()).orElseThrow();
+        assertEquals(BigDecimal.ZERO.setScale(4), wallet.getBalance().setScale(4));
+    }
+
+    @Test
+    public void testUserRegistrationDuplicateUsername() throws Exception {
+        // Save an initial user
+        userRepository.save(UserEntry.builder()
+                .username("john_doe")
+                .email("old@example.com")
+                .phoneno("0987654321")
+                .password(passwordEncoder.encode("pass1"))
+                .walletId("wallet_1")
+                .build());
+
+        UserRegisterRequest request = UserRegisterRequest.builder()
+                .username("john_doe") // Duplicate
+                .email("john@example.com")
+                .phoneno("1234567890")
+                .password("password123")
+                .build();
+
+        mockMvc.perform(post("/user/register")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error", is("Username already exists ! Try another Username ...")));
+    }
+
+    @Test
+    public void testUserLoginSuccess() throws Exception {
+        // Save an initial user
+        userRepository.save(UserEntry.builder()
+                .username("john_doe")
+                .email("john@example.com")
+                .phoneno("1234567890")
+                .password(passwordEncoder.encode("password123"))
+                .walletId("wallet_1")
+                .build());
+
+        UserLoginRequest request = new UserLoginRequest("john_doe", "password123");
+
+        mockMvc.perform(post("/user/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.username", is("john_doe")))
+                .andExpect(jsonPath("$.walletId", is("wallet_1")))
+                .andExpect(jsonPath("$.message", is("Login successful")));
+    }
+
+    @Test
+    public void testUserLoginWrongPassword() throws Exception {
+        // Save an initial user
+        userRepository.save(UserEntry.builder()
+                .username("john_doe")
+                .email("john@example.com")
+                .phoneno("1234567890")
+                .password(passwordEncoder.encode("password123"))
+                .walletId("wallet_1")
+                .build());
+
+        UserLoginRequest request = new UserLoginRequest("john_doe", "wrong_pass");
+
+        mockMvc.perform(post("/user/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error", is("Invalid username or password")));
+    }
 }
+
